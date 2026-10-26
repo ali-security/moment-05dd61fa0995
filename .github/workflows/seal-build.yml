@@ -1,0 +1,87 @@
+name: seal-build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '19.0.1'
+      - name: Install release-era build tools (package-lock.json)
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Regenerate the shipped bundles from src (Gruntfile release minus lint/test)
+        run: |
+          ./node_modules/.bin/grunt transpile update-index component uglify:main
+          echo "Bundles that differ from the committed tag files:"
+          git status --short
+      - name: Stage the npm package (upstream scripts/npm_prepublish.sh)
+        run: |
+          bash scripts/npm_prepublish.sh HEAD
+          # npm_prepublish.sh stages from a git clone of HEAD; refresh every
+          # staged file from the regenerated working tree.
+          (cd ../moment-npm && find . -type f -print) | while read -r f; do
+            cp "$f" "../moment-npm/$f"
+          done
+      - name: Pack
+        run: |
+          cd ../moment-npm
+          npm pack
+          mkdir -p "$GITHUB_WORKSPACE/seal-dist"
+          cp moment-*.tgz "$GITHUB_WORKSPACE/seal-dist/"
+          tar -tzf "$GITHUB_WORKSPACE/seal-dist/moment-2.30.1.tgz" | wc -l
+      - name: Check every shipped bundle carries the src isLocaleNameSane check
+        run: |
+          rm -rf /tmp/seal-check && mkdir /tmp/seal-check
+          tar -xzf seal-dist/moment-2.30.1.tgz -C /tmp/seal-check
+          node - /tmp/seal-check/package <<'EOF'
+          var fs = require('fs'), path = require('path'), pkg = process.argv[2];
+          // name.match('^[^/\\\\]*$') -- the pre-fix path check, as written in src and every bundle
+          var OLD = '^[^/' + '\\'.repeat(4) + ']*$';
+          var src = fs.readFileSync('src/lib/locale/locales.js', 'utf8');
+          var start = src.indexOf('function isLocaleNameSane');
+          var body = src.slice(start, src.indexOf('\n}', start));
+          var patched = start >= 0 && body.indexOf(OLD) < 0;
+          var whitelist = (body.match(/\/\^[^\n]*?\$\//) || [])[0];
+          if (patched && (body.indexOf('typeof') < 0 || !whitelist)) {
+              console.error('src isLocaleNameSane has no typeof/whitelist check:\n' + body);
+              process.exit(1);
+          }
+          var core = ['moment.js', 'dist/moment.js', 'min/moment.min.js',
+              'min/moment-with-locales.js', 'min/moment-with-locales.min.js'];
+          var files = ['moment.js', 'dist/moment.js'].concat(
+              fs.readdirSync(path.join(pkg, 'min')).filter(function (f) {
+                  return /\.js$/.test(f);
+              }).map(function (f) { return 'min/' + f; }));
+          var bad = 0;
+          core.forEach(function (f) {
+              if (files.indexOf(f) < 0) { console.error('missing bundle ' + f); bad++; }
+          });
+          files.forEach(function (f) {
+              var text = fs.readFileSync(path.join(pkg, f), 'utf8');
+              var hasCore = text.indexOf('./locale/') >= 0;
+              var hasOld = text.indexOf(OLD) >= 0;
+              var at = whitelist ? text.indexOf(whitelist) : -1;
+              // typeof guard right before the whitelist test (src or minified form)
+              var hasNew = at >= 0 && text.slice(Math.max(0, at - 60), at).indexOf('typeof') >= 0;
+              var ok = patched ? !hasOld && (!hasCore || hasNew) : (!hasCore || hasOld);
+              if (core.indexOf(f) >= 0 && !hasCore) ok = false;
+              console.log((ok ? 'ok   ' : 'FAIL ') + f + ' loader=' + hasCore +
+                  ' old-match=' + hasOld + ' whitelist=' + hasNew);
+              if (!ok) bad++;
+          });
+          console.log('src isLocaleNameSane: ' + (patched ? 'typeof/whitelist ' + whitelist : 'old name.match() check'));
+          if (bad) { console.error(bad + ' bundle(s) do not match src'); process.exit(1); }
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: moment-npm-tgz
+          path: seal-dist/moment-2.30.1.tgz
+          if-no-files-found: error
